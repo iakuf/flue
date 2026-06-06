@@ -1,195 +1,289 @@
 import { describe, it, expect, vi } from 'vitest';
 import { parallel, pipeline, phase, log, registerWorkflow } from '../src/orchestrate.ts';
-import type { FlueSession, PromptResponse } from '../src/types.ts';
+import type { FlueHarness, FlueSession, PromptResponse } from '../src/types.ts';
 
-function createMockSession(responses: Record<string, string> = {}): FlueSession {
-	const taskFn = vi.fn(async (prompt: string): Promise<PromptResponse> => {
-		const key = Object.keys(responses).find((k) => prompt.includes(k));
-		const text = key ? responses[key] : `response-for-${prompt.slice(0, 20)}`;
-		await new Promise((r) => setTimeout(r, 10));
-		return { text } as PromptResponse;
-	});
-	return { task: taskFn } as unknown as FlueSession;
+/**
+ * A mock session that faithfully reproduces Flue's exclusive-operation lock:
+ * starting a second operation while one is active throws, exactly like the
+ * real runtime. This is what makes the concurrency tests meaningful.
+ */
+function createLockedSession(
+	name: string,
+	behavior: (prompt: string) => Promise<PromptResponse>,
+): FlueSession {
+	let active = false;
+	return {
+		name,
+		async prompt(prompt: string): Promise<PromptResponse> {
+			if (active) {
+				throw new Error(
+					`[flue] Session "${name}" is already running prompt. Start another session for parallel conversation branches.`,
+				);
+			}
+			active = true;
+			try {
+				return await behavior(prompt);
+			} finally {
+				active = false;
+			}
+		},
+	} as unknown as FlueSession;
 }
 
-function createFailingSession(failOn: string[]): FlueSession {
-	const taskFn = vi.fn(async (prompt: string): Promise<PromptResponse> => {
-		await new Promise((r) => setTimeout(r, 5));
-		if (failOn.some((f) => prompt.includes(f))) {
-			throw new Error(`Task failed: ${prompt}`);
-		}
-		return { text: `ok-for-${prompt.slice(0, 10)}` } as PromptResponse;
-	});
-	return { task: taskFn } as unknown as FlueSession;
+/**
+ * A mock harness that hands out a fresh locked session per name and tracks
+ * how many distinct sessions were created/deleted (to prove true isolation
+ * and cleanup).
+ */
+function createMockHarness(
+	behavior: (prompt: string) => Promise<PromptResponse> = async (p) =>
+		({ text: `response-for-${p.slice(0, 20)}` }) as PromptResponse,
+) {
+	const created = new Set<string>();
+	const deleted = new Set<string>();
+	const sessions = new Map<string, FlueSession>();
+
+	const harness = {
+		name: 'mock',
+		async session(name = 'default'): Promise<FlueSession> {
+			created.add(name);
+			let s = sessions.get(name);
+			if (!s) {
+				s = createLockedSession(name, behavior);
+				sessions.set(name, s);
+			}
+			return s;
+		},
+		sessions: {
+			async create(name = 'default') {
+				return harness.session(name);
+			},
+			async get(name = 'default') {
+				return harness.session(name);
+			},
+			async delete(name = 'default') {
+				deleted.add(name);
+				sessions.delete(name);
+			},
+		},
+	} as unknown as FlueHarness;
+
+	return { harness, created, deleted };
 }
 
 describe('parallel()', () => {
-	it('runs multiple tasks and returns all results', async () => {
-		const session = createMockSession({
-			'Analyze auth flow': 'auth-analysis',
-			'Analyze rate limiting': 'rate-analysis',
-			'Analyze cache strategy': 'cache-analysis',
+	it('runs multiple tasks and returns all results in order', async () => {
+		const { harness } = createMockHarness(async (prompt) => {
+			if (prompt.includes('auth')) return { text: 'auth-result' } as PromptResponse;
+			if (prompt.includes('rate')) return { text: 'rate-result' } as PromptResponse;
+			return { text: 'cache-result' } as PromptResponse;
 		});
 
-		const results = await parallel(session, [
-			{ prompt: 'Analyze auth flow' },
-			{ prompt: 'Analyze rate limiting' },
-			{ prompt: 'Analyze cache strategy' },
+		const results = await parallel(harness, [
+			{ prompt: 'Analyze auth' },
+			{ prompt: 'Analyze rate' },
+			{ prompt: 'Analyze cache' },
 		]);
 
 		expect(results).toHaveLength(3);
-		expect(results[0]?.text).toBe('auth-analysis');
-		expect(results[1]?.text).toBe('rate-analysis');
-		expect(results[2]?.text).toBe('cache-analysis');
+		expect(results[0]?.text).toBe('auth-result');
+		expect(results[1]?.text).toBe('rate-result');
+		expect(results[2]?.text).toBe('cache-result');
 	});
 
-	it('returns empty array for empty input', async () => {
-		const results = await parallel({} as FlueSession, []);
-		expect(results).toEqual([]);
+	it('uses a DISTINCT session per task (true isolation, no lock contention)', async () => {
+		// Each task sleeps so they overlap in time. If they shared one session,
+		// the locked-session mock would throw. Distinct sessions => all succeed.
+		const { harness, created, deleted } = createMockHarness(async (p) => {
+			await new Promise((r) => setTimeout(r, 30));
+			return { text: `done-${p}` } as PromptResponse;
+		});
+
+		const results = await parallel(
+			harness,
+			Array.from({ length: 5 }, (_, i) => ({ prompt: `task-${i}` })),
+		);
+
+		expect(results.every((r) => r !== null)).toBe(true);
+		expect(created.size).toBe(5);
+		expect(deleted.size).toBe(5);
 	});
 
 	it('respects concurrency limit', async () => {
 		let concurrent = 0;
 		let maxConcurrent = 0;
-
-		const session = {
-			task: vi.fn(async (): Promise<PromptResponse> => {
-				concurrent++;
-				maxConcurrent = Math.max(maxConcurrent, concurrent);
-				await new Promise((r) => setTimeout(r, 50));
-				concurrent--;
-				return { text: 'done' } as PromptResponse;
-			}),
-		} as unknown as FlueSession;
+		const { harness } = createMockHarness(async () => {
+			concurrent++;
+			maxConcurrent = Math.max(maxConcurrent, concurrent);
+			await new Promise((r) => setTimeout(r, 40));
+			concurrent--;
+			return { text: 'done' } as PromptResponse;
+		});
 
 		await parallel(
-			session,
-			Array.from({ length: 10 }, (_, i) => ({ prompt: `task-${i}` })),
+			harness,
+			Array.from({ length: 10 }, (_, i) => ({ prompt: `t-${i}` })),
 			{ concurrency: 3 },
 		);
 
 		expect(maxConcurrent).toBeLessThanOrEqual(3);
 	});
 
+	it('returns empty array for empty input', async () => {
+		const { harness } = createMockHarness();
+		expect(await parallel(harness, [])).toEqual([]);
+	});
+
 	it('lenient mode: failed tasks return null, others complete', async () => {
-		const session = createFailingSession(['dangerous']);
-		const results = await parallel(session, [
-			{ prompt: 'safe task 1' },
-			{ prompt: 'dangerous task' },
-			{ prompt: 'safe task 2' },
+		const { harness } = createMockHarness(async (p) => {
+			if (p.includes('bad')) throw new Error('boom');
+			return { text: `ok-${p}` } as PromptResponse;
+		});
+
+		const results = await parallel(harness, [
+			{ prompt: 'good 1' },
+			{ prompt: 'bad' },
+			{ prompt: 'good 2' },
 		]);
 
-		expect(results).toHaveLength(3);
-		expect(results[0]?.text).toContain('ok-for');
+		expect(results[0]?.text).toContain('ok-');
 		expect(results[1]).toBeNull();
-		expect(results[2]?.text).toContain('ok-for');
+		expect(results[2]?.text).toContain('ok-');
 	});
 
-	it('strict mode: first failure aborts remaining tasks', async () => {
-		const session = createFailingSession(['fail']);
+	it('strict mode: first failure aborts and throws', async () => {
+		const { harness } = createMockHarness(async (p) => {
+			if (p.includes('fail')) throw new Error('Task exploded');
+			await new Promise((r) => setTimeout(r, 10));
+			return { text: 'ok' } as PromptResponse;
+		});
+
 		await expect(
-			parallel(session, [
-				{ prompt: 'ok task' },
-				{ prompt: 'fail task' },
-				{ prompt: 'should not run' },
-			], { failMode: 'strict' }),
-		).rejects.toThrow('Task failed');
+			parallel(
+				harness,
+				[{ prompt: 'ok' }, { prompt: 'fail' }, { prompt: 'ok' }],
+				{ failMode: 'strict' },
+			),
+		).rejects.toThrow('Task exploded');
 	});
 
-	it('passes agent and cwd options to session.task()', async () => {
-		const session = createMockSession();
-		await parallel(session, [
-			{ prompt: 'do work', agent: 'researcher', cwd: '/workspace' },
-		]);
+	it('cleans up sessions even when a task fails', async () => {
+		const { harness, created, deleted } = createMockHarness(async (p) => {
+			if (p.includes('bad')) throw new Error('boom');
+			return { text: 'ok' } as PromptResponse;
+		});
 
-		expect(session.task).toHaveBeenCalledWith('do work', expect.objectContaining({
-			agent: 'researcher',
-			cwd: '/workspace',
-		}));
+		await parallel(harness, [{ prompt: 'good' }, { prompt: 'bad' }]);
+
+		expect(deleted.size).toBe(created.size);
+		expect(deleted.size).toBe(2);
+	});
+
+	it('throws if signal already aborted', async () => {
+		const { harness } = createMockHarness();
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			parallel(harness, [{ prompt: 'x' }], { signal: controller.signal }),
+		).rejects.toThrow('Aborted');
 	});
 });
 
 describe('pipeline()', () => {
-	it('processes items through sequential stages', async () => {
-		const session = createMockSession({
-			Analyze: 'analyzed-result',
-			Verify: 'verified-result',
-			Format: 'formatted-result',
+	it('runs stages sequentially within an item, passing output forward', async () => {
+		const seen: string[] = [];
+		const { harness } = createMockHarness(async (p) => {
+			seen.push(p);
+			return { text: `${p}=>out` } as PromptResponse;
 		});
 
-		const items: PromptResponse[] = [{ text: 'raw-data-1' } as PromptResponse];
-
-		const results = await pipeline(session, items, [
-			(input) => ({ prompt: `Analyze: ${input.text}` }),
-			(input) => ({ prompt: `Verify: ${input.text}` }),
-			(input) => ({ prompt: `Format: ${input.text}` }),
+		const results = await pipeline(harness, [{ text: 'seed' } as PromptResponse], [
+			(input) => ({ prompt: `S1:${input.text}` }),
+			(input) => ({ prompt: `S2:${input.text}` }),
+			(input) => ({ prompt: `S3:${input.text}` }),
 		]);
 
 		expect(results).toHaveLength(1);
-		expect(results[0]?.text).toBe('formatted-result');
-		expect(session.task).toHaveBeenCalledTimes(3);
+		expect(seen[0]).toBe('S1:seed');
+		expect(seen[1]).toBe('S2:S1:seed=>out');
+		expect(seen[2]).toContain('S3:');
 	});
 
-	it('processes multiple items concurrently', async () => {
-		const session = createMockSession();
-		const items: PromptResponse[] = [
-			{ text: 'item-1' } as PromptResponse,
-			{ text: 'item-2' } as PromptResponse,
-			{ text: 'item-3' } as PromptResponse,
-		];
+	it('reuses ONE session across an item stages (sequential, no lock error)', async () => {
+		const { harness, created, deleted } = createMockHarness(async () => {
+			await new Promise((r) => setTimeout(r, 10));
+			return { text: 'ok' } as PromptResponse;
+		});
 
-		const results = await pipeline(session, items, [
-			(input) => ({ prompt: `Process: ${input.text}` }),
+		await pipeline(harness, [{ text: 'a' } as PromptResponse], [
+			(i) => ({ prompt: `1:${i.text}` }),
+			(i) => ({ prompt: `2:${i.text}` }),
 		]);
 
+		expect(created.size).toBe(1);
+		expect(deleted.size).toBe(1);
+	});
+
+	it('processes multiple items on distinct sessions', async () => {
+		const { harness, created } = createMockHarness();
+		const items = [
+			{ text: 'i1' } as PromptResponse,
+			{ text: 'i2' } as PromptResponse,
+			{ text: 'i3' } as PromptResponse,
+		];
+
+		const results = await pipeline(harness, items, [(i) => ({ prompt: `go:${i.text}` })]);
+
 		expect(results).toHaveLength(3);
-		expect(results.every((r) => r !== null)).toBe(true);
+		expect(created.size).toBe(3);
 	});
 
 	it('returns empty for empty items or stages', async () => {
-		expect(await pipeline({} as FlueSession, [], [])).toEqual([]);
-		expect(await pipeline({} as FlueSession, [{ text: 'x' } as PromptResponse], [])).toEqual([]);
+		const { harness } = createMockHarness();
+		expect(await pipeline(harness, [], [(i) => ({ prompt: i.text })])).toEqual([]);
+		expect(await pipeline(harness, [{ text: 'x' } as PromptResponse], [])).toEqual([]);
 	});
 
 	it('failed items return null without crashing others', async () => {
-		const session = createFailingSession(['bad']);
-		const items: PromptResponse[] = [
-			{ text: 'good' } as PromptResponse,
-			{ text: 'bad' } as PromptResponse,
-			{ text: 'good' } as PromptResponse,
-		];
+		const { harness } = createMockHarness(async (p) => {
+			if (p.includes('bad')) throw new Error('boom');
+			return { text: 'ok' } as PromptResponse;
+		});
 
-		const results = await pipeline(session, items, [
-			(input) => ({ prompt: `Process: ${input.text}` }),
-		]);
+		const results = await pipeline(
+			harness,
+			[
+				{ text: 'good' } as PromptResponse,
+				{ text: 'bad' } as PromptResponse,
+				{ text: 'good' } as PromptResponse,
+			],
+			[(i) => ({ prompt: `p:${i.text}` })],
+		);
 
-		expect(results).toHaveLength(3);
 		expect(results[0]).not.toBeNull();
 		expect(results[1]).toBeNull();
 		expect(results[2]).not.toBeNull();
 	});
 
 	it('supports named workflows as string stages', async () => {
-		const session = createMockSession({ 'Run full analysis on': 'analyzed' });
+		const { harness } = createMockHarness();
+		registerWorkflow('analyze', async (input, session) =>
+			session.prompt(`analyze:${input.text}`),
+		);
 
-		registerWorkflow('full-analysis', async (input) => {
-			return session.task(`Run full analysis on: ${input.text}`);
-		});
-
-		const items: PromptResponse[] = [{ text: 'ticket-42' } as PromptResponse];
-		const results = await pipeline(session, items, [
-			'full-analysis',
-			(input) => ({ prompt: `Summarize: ${input.text}` }),
+		const results = await pipeline(harness, [{ text: 'ticket' } as PromptResponse], [
+			'analyze',
+			(input) => ({ prompt: `summarize:${input.text}` }),
 		]);
 
 		expect(results).toHaveLength(1);
 		expect(results[0]?.text).toBeDefined();
 	});
 
-	it('throws for unknown workflow name', async () => {
-		const items: PromptResponse[] = [{ text: 'x' } as PromptResponse];
+	it('throws for unknown workflow name (fail fast, before execution)', async () => {
+		const { harness } = createMockHarness();
 		await expect(
-			pipeline(createMockSession(), items, ['nonexistent-workflow']),
+			pipeline(harness, [{ text: 'x' } as PromptResponse], ['does-not-exist']),
 		).rejects.toThrow('Unknown workflow');
 	});
 });
