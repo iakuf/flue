@@ -5,31 +5,56 @@
  * code-driven control over "what runs when" while letting the LLM handle
  * "what to say/do" within each step.
  *
+ * ## Concurrency model
+ *
+ * A Flue {@link FlueSession} runs operations **exclusively** — starting a
+ * second operation on a session that is already running one throws
+ * ("Start another session for parallel conversation branches"). True
+ * parallelism therefore requires **one session per concurrent unit**.
+ *
+ * These primitives take a {@link FlueHarness} (not a single session) and
+ * allocate an isolated session for each concurrent task, then clean it up
+ * when done. Callers describe tasks; the orchestrator owns session lifecycle.
+ *
  * Design principles:
+ * - Correct: never runs two operations on one session (respects the runtime lock)
  * - Deterministic: orchestration logic is TypeScript, not LLM-generated
  * - Barrier-aware: parallel() waits for all; pipeline() is barrier-free
  * - Fault-tolerant: failed tasks return null by default, never crash the batch
- * - Schema-first: every task can enforce structured output
- * - Observable: phase markers and events for tracing/UI integration
+ * - Self-cleaning: isolated sessions are deleted after use
+ *
+ * @example
+ * ```ts
+ * import { parallel, pipeline, phase } from './orchestrate.ts';
+ *
+ * const harness = await init(agent);
+ *
+ * phase('Research');
+ * const results = await parallel(harness, [
+ *   { prompt: 'Analyze auth flow', label: 'auth' },
+ *   { prompt: 'Check rate limiting', label: 'rate-limit' },
+ * ]);
+ * ```
  *
  * @module
  */
 
-import type { FlueSession, PromptResponse, TaskOptions } from './types.ts';
+import type {
+	FlueHarness,
+	FlueSession,
+	PromptResponse,
+	PromptOptions,
+} from './types.ts';
 import type * as v from 'valibot';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /** A single task descriptor for parallel/pipeline execution. */
 export interface TaskDescriptor<S extends v.GenericSchema | undefined = undefined> {
-	/** The prompt to send to the sub-agent. */
+	/** The prompt to send to the agent. */
 	prompt: string;
 	/** Display label for observability (like Claude Code's `label` option). */
 	label?: string;
-	/** Route to a declared sub-agent profile by name. */
-	agent?: string;
-	/** Working directory override for the task's sandbox. */
-	cwd?: string;
 	/** Optional valibot schema for structured result extraction. */
 	result?: S;
 	/** Override model for this specific task. */
@@ -50,6 +75,11 @@ export interface ParallelOptions {
 	failMode?: 'lenient' | 'strict';
 	/** AbortSignal to cancel all pending tasks. */
 	signal?: AbortSignal;
+	/**
+	 * Prefix for the isolated session names this call allocates.
+	 * Default: "parallel". Useful for tracing/debugging.
+	 */
+	sessionPrefix?: string;
 }
 
 export interface PipelineOptions {
@@ -60,47 +90,90 @@ export interface PipelineOptions {
 	concurrency?: number;
 	/** AbortSignal to cancel processing. */
 	signal?: AbortSignal;
+	/** Prefix for the isolated session names. Default: "pipeline". */
+	sessionPrefix?: string;
 }
 
 /** Result from a parallel() or pipeline() execution. */
 export type OrchestrationResult = PromptResponse | null;
 
-// ─── Phase ──────────────────────────────────────────────────────────────────
+// ─── Phase / log ────────────────────────────────────────────────────────────
 
 /**
  * Mark a new orchestration phase. Phases are logical groupings for
- * observability — they appear in traces, logs, and any future UI.
- *
- * Equivalent to Claude Code Workflows' `phase(title)`.
+ * observability. Equivalent to Claude Code Workflows' `phase(title)`.
  */
 export function phase(title: string): void {
 	const timestamp = new Date().toISOString();
 	console.log(`[orchestrate] ---- ${title} ---- (${timestamp})`);
 }
 
-/**
- * Log a narrative message within the current orchestration flow.
- * Equivalent to Claude Code Workflows' `log(msg)`.
- */
+/** Log a narrative message within the current orchestration flow. */
 export function log(message: string): void {
 	console.log(`[orchestrate] ${message}`);
+}
+
+// ─── Internal: run one task on a fresh isolated session ───────────────────────
+
+async function runIsolated(
+	harness: FlueHarness,
+	sessionName: string,
+	prompt: string,
+	promptOpts: PromptOptions,
+): Promise<PromptResponse> {
+	const session = await harness.session(sessionName);
+	try {
+		return await session.prompt(prompt, promptOpts);
+	} finally {
+		// Best-effort cleanup. delete() rejects if an operation is still active,
+		// which cannot happen here because prompt() has already settled.
+		await harness.sessions.delete(sessionName).catch(() => {});
+	}
+}
+
+function buildPromptOptions(
+	task: Pick<TaskDescriptor, 'result' | 'model'>,
+	signal?: AbortSignal,
+): PromptOptions {
+	const opts: PromptOptions = {};
+	if (signal) opts.signal = signal;
+	if (task.model) opts.model = task.model;
+	if (task.result) (opts as any).result = task.result;
+	return opts;
 }
 
 // ─── Parallel ───────────────────────────────────────────────────────────────
 
 /**
- * Execute multiple tasks concurrently with barrier semantics.
- * Waits for ALL tasks to complete (or fail) before returning.
+ * Execute multiple tasks concurrently, each on its own isolated session.
+ * Waits for ALL tasks to complete (or fail) before returning (barrier).
  *
- * Failed tasks return `null` in lenient mode (default).
- * In strict mode, the first failure aborts remaining tasks and throws.
+ * Because each task runs on a dedicated session, this achieves true
+ * parallelism without hitting the per-session exclusive-operation lock.
+ *
+ * Failed tasks return `null` in lenient mode (default). In strict mode the
+ * first failure aborts remaining tasks and throws.
+ *
+ * @example
+ * ```ts
+ * const results = await parallel(harness, [
+ *   { prompt: 'Research authentication patterns' },
+ *   { prompt: 'Research rate limiting patterns' },
+ *   { prompt: 'Research caching strategies' },
+ * ], { concurrency: 8 });
+ * ```
  */
 export async function parallel(
-	session: FlueSession,
+	harness: FlueHarness,
 	tasks: TaskDescriptor[],
 	options?: ParallelOptions,
 ): Promise<OrchestrationResult[]> {
-	const { concurrency = 16, failMode = 'lenient', signal } = options ?? {};
+	const {
+		concurrency = 16,
+		failMode = 'lenient',
+		signal,
+		sessionPrefix = 'parallel',
+	} = options ?? {};
 
 	if (tasks.length === 0) return [];
 
@@ -115,8 +188,8 @@ export async function parallel(
 	let firstError: Error | null = null;
 
 	if (signal) {
-		signal.addEventListener('abort', () => abortController.abort(signal.reason), { once: true });
 		if (signal.aborted) throw new Error('[orchestrate] Aborted before start');
+		signal.addEventListener('abort', () => abortController.abort(signal.reason), { once: true });
 	}
 
 	const promises = queue.map(async ({ task, index }) => {
@@ -126,16 +199,10 @@ export async function parallel(
 			return;
 		}
 
+		const sessionName = `${sessionPrefix}-${index}-${crypto.randomUUID()}`;
 		try {
-			const taskOpts: TaskOptions = { signal: abortController.signal };
-			if (task.agent) taskOpts.agent = task.agent;
-			if (task.cwd) taskOpts.cwd = task.cwd;
-			if (task.model) taskOpts.model = task.model;
-			if (task.result) (taskOpts as any).result = task.result;
-
-			const result = await session.task(task.prompt, taskOpts);
-			results[index] = result;
-
+			const promptOpts = buildPromptOptions(task, abortController.signal);
+			results[index] = await runIsolated(harness, sessionName, task.prompt, promptOpts);
 			if (task.label) log(`[OK] ${task.label}`);
 		} catch (err) {
 			if (failMode === 'strict' && !firstError) {
@@ -143,7 +210,6 @@ export async function parallel(
 				abortController.abort(firstError);
 			}
 			results[index] = null;
-
 			if (task.label) {
 				log(`[FAIL] ${task.label}: ${err instanceof Error ? err.message : err}`);
 			}
@@ -154,9 +220,7 @@ export async function parallel(
 
 	await Promise.all(promises);
 
-	if (failMode === 'strict' && firstError) {
-		throw firstError;
-	}
+	if (failMode === 'strict' && firstError) throw firstError;
 
 	return results;
 }
@@ -164,9 +228,8 @@ export async function parallel(
 // ─── Workflow Registry ──────────────────────────────────────────────────────
 
 /**
- * A named, reusable workflow that takes the output of the previous stage
- * and returns the input for the next one. Internally it may call
- * session.task(), session.prompt(), or any orchestration primitive.
+ * A named, reusable workflow that takes the output of the previous stage and
+ * returns the input for the next. It receives a dedicated isolated session.
  */
 export type NamedWorkflow = (
 	input: PromptResponse,
@@ -177,24 +240,20 @@ const workflowRegistry = new Map<string, NamedWorkflow>();
 
 /**
  * Register a named workflow for later reference in pipeline stages.
- * A registered workflow can be referenced by its string name instead
- * of an inline function.
  *
  * @example
  * ```ts
- * registerWorkflow('analyze-ticket', async (input, session) => {
- *   return session.task(`Analyze: ${input.text}`);
- * });
- * pipeline(session, tickets, ['analyze-ticket', 'verify', 'respond']);
+ * registerWorkflow('analyze-ticket', async (input, session) =>
+ *   session.prompt(`Analyze: ${input.text}`),
+ * );
+ * pipeline(harness, tickets, ['analyze-ticket', 'verify']);
  * ```
  */
 export function registerWorkflow(name: string, workflow: NamedWorkflow): void {
 	workflowRegistry.set(name, workflow);
 }
 
-/**
- * Resolve a registered workflow by name. Throws if not found.
- */
+/** Resolve a registered workflow by name. Throws if not found. */
 export function resolveWorkflow(name: string): NamedWorkflow {
 	const workflow = workflowRegistry.get(name);
 	if (!workflow) {
@@ -223,21 +282,33 @@ export type PipelineStage =
 
 /**
  * Process items through a multi-stage pipeline WITHOUT barrier.
- * Each item flows independently through all stages — fast items
- * don't wait for slow ones.
+ * Each item flows independently through all stages on its own isolated
+ * session — fast items don't wait for slow ones.
+ *
+ * Within one item the stages run sequentially (each stage sees the previous
+ * stage's output). Across items there is no synchronization.
+ *
+ * @example
+ * ```ts
+ * const responses = await pipeline(harness, tickets, [
+ *   (ticket) => ({ prompt: `Analyze: ${ticket.text}` }),
+ *   (analysis) => ({ prompt: `Verify: ${analysis.text}` }),
+ *   'format-response',
+ * ]);
+ * ```
  */
 export async function pipeline(
-	session: FlueSession,
+	harness: FlueHarness,
 	items: PromptResponse[],
 	stages: PipelineStage[],
 	options?: PipelineOptions,
 ): Promise<OrchestrationResult[]> {
-	const { concurrency = 16, signal } = options ?? {};
+	const { concurrency = 16, signal, sessionPrefix = 'pipeline' } = options ?? {};
 
 	if (items.length === 0 || stages.length === 0) return [];
 	if (signal?.aborted) throw new Error('[orchestrate] Aborted before start');
 
-	// Eagerly validate all named workflow references.
+	// Eagerly validate all named workflow references so bad names fail fast.
 	for (const stage of stages) {
 		if (typeof stage === 'string') resolveWorkflow(stage);
 	}
@@ -245,9 +316,13 @@ export async function pipeline(
 	const semaphore = new Semaphore(Math.min(concurrency, items.length));
 
 	return Promise.all(
-		items.map(async (item) => {
+		items.map(async (item, index) => {
 			await semaphore.acquire();
+			// One session per item, reused across this item's sequential stages.
+			const sessionName = `${sessionPrefix}-${index}-${crypto.randomUUID()}`;
+			let session: FlueSession | undefined;
 			try {
+				session = await harness.session(sessionName);
 				let current: PromptResponse = item;
 
 				for (const stage of stages) {
@@ -260,19 +335,17 @@ export async function pipeline(
 					}
 
 					const descriptor = stage(current);
-					const taskOpts: TaskOptions = { signal };
-					if (descriptor.agent) taskOpts.agent = descriptor.agent;
-					if (descriptor.cwd) taskOpts.cwd = descriptor.cwd;
-					if (descriptor.model) taskOpts.model = descriptor.model;
-					if (descriptor.result) (taskOpts as any).result = descriptor.result;
-
-					current = await session.task(descriptor.prompt, taskOpts);
+					const promptOpts = buildPromptOptions(descriptor, signal);
+					current = await session.prompt(descriptor.prompt, promptOpts);
 				}
 
 				return current;
 			} catch {
 				return null;
 			} finally {
+				if (session) {
+					await harness.sessions.delete(sessionName).catch(() => {});
+				}
 				semaphore.release();
 			}
 		}),
